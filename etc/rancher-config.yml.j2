@@ -1,0 +1,74 @@
+### https://rancher.com/docs/rke/latest/en/config-options/
+
+cluster_name: local
+
+dns:
+  provider: coredns
+
+addon_job_timeout: 30
+
+# If set to true, RKE will not fail when unsupported Docker version are found
+# https://github.com/rancher/rke/issues/2378
+ignore_docker_version: true
+kubernetes_version: "{{ data.rke_k8s_version }}"
+
+# https://rancher.com/docs/rke/latest/en/config-options/add-ons/ingress-controllers/
+ingress:
+  options:
+    use-forwarded-headers: 'true'
+  provider: nginx
+
+monitoring:
+  provider: metrics-server
+
+network:
+  plugin: canal
+
+# https://rancher.com/docs/rke/latest/en/config-options/authentication/
+authentication:
+  strategy: x509
+
+# Cluster level SSH private key
+# Used if no ssh information is set for the node
+ssh_key_path: ./home/rancher_poc_2/.ssh/rancher_private.rsa
+
+# Enable use of SSH agent to use SSH private keys with passphrase
+# This requires the environment `SSH_AUTH_SOCK` configured pointing
+# to your SSH agent which has the private key added
+ssh_agent_auth: true
+
+# https://rancher.com/docs/rke/latest/en/config-options/nodes/
+nodes:
+{% for node in hostlist %}
+  - address: {{ node.ip | indent }}
+    hostname_override: {{ node.name | indent }}
+    user: {{ data.ansible_user | indent }}
+    role:
+    - controlplane
+    - etcd
+    - worker
+{% endfor %}
+
+# https://rancher.com/docs/rke/latest/en/config-options/private-registries/
+private_registries:
+  - url: {{ data.docker_registry }}
+    is_default: true
+
+services:
+  kube-api:
+    secrets_encryption_config:
+      enabled: true
+  etcd:
+    snapshot: true
+    backup_config:
+      interval_hours: 12
+      retention: 20
+      s3backupconfig:
+        access_key: {{ data.s3_access_key }}
+        secret_key: {{ data.s3_secret_key }}
+        bucket_name: rancher-backup-operator-{{ data.cluster_name }}
+        region: "eu-central-1"
+        folder: "local"
+        endpoint: s3
+        custom_ca: |-
+{% include 'root-certs.txt' %}
