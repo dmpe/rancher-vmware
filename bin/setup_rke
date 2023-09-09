@@ -44,21 +44,27 @@ EOF
   exit "$1"
 }
 
+_cleanup_tmpdir() {
+  rm -rf $WORK_DIR
+}
+
 _setup() {
   declare -g -a HOST_IDS args
   declare -g dry action target_hostnames domain s3_acc_key s3_sec_key
   declare -g rke_k8s_version rke_version rke_user_token gpg_key site registry
   declare -g node_type
 
-  gpg_key=gitlab-runner
-  helm_release="rancher-rke"
+  gpg_key=gitlab-runner # used for SOPS
+  helm_release="rancher-rke" # rancher/rancher helm chart - just different name due to naming conflicts
   domain=
-  site=alp
+  site=firm.com
   registry="nexus.$site:6666"
 
-  _check_env SOPS_SECRETS_PASSPHRASE ANSIBLE_SSH
+  #
+  export SOPS_SECRETS_PASSPHRASE=pass
+  export ANSIBLE_SSH=password-for-ssh-key
 
-  _setup_tmpdir
+  WORK_DIR=$(mktemp -d -p "$DIR")
   trap _cleanup_tmpdir EXIT
 
   true
@@ -225,6 +231,8 @@ EOF
   "$base"/sbin/tf_start rke_configuration --domain "$domain" --token "$rke_user_token"
 }
 
+# Function encrypt Rancher MNG secrets using SOPS. 
+# it creates tar file which is then encrypted and stored in git repository
 _encrypt_rke_secrets() {
 
   if [[ -z "$domain" ]]; then
@@ -259,6 +267,7 @@ _init_config() {
   _encrypt_rke_secrets
 }
 
+# see above - same but decrypts the tar folder
 _decrypt_rke_secrets() {
 
   if [[ -z "$domain" ]]; then

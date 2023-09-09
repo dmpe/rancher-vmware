@@ -1,3 +1,5 @@
+#!/bin/bash 
+
 _gojq_data() {
   gojq -r '.data.[]'
 }
@@ -9,17 +11,17 @@ _rancher_registr_cmd() {
   # 4. VM/node role: worker or control
 
   # In order to get registration cmd for adding nodes, we first need to get rancher's internal name for the downstream cluster.
-  _clusterId=$(_curl -u ${2} "${1}/v3/clusters" | _gojq_data | gojq -r --arg cluster "${3}" 'select(.name==$cluster) | .id')
+  _clusterId=$(curl --silent --fail -u ${2} "${1}/v3/clusters" | _gojq_data | gojq -r --arg cluster "${3}" 'select(.name==$cluster) | .id')
   # For local debugging only. This may not be activated for the "production" purposes because
   # other scripts read output of this function.
   # _info "Register Rancher Node for cluster: ${_clusterId}"
 
   # We first try to extract command from JSON object, which has creatorID != null
-  _command=$(_curl "${1}/v3/clusterregistrationtokens" | _gojq_data | gojq -r --arg clusterID "${_clusterId}" 'select((.clusterId==$clusterID) and (.creatorId != null)) | .nodeCommand')
+  _command=$(curl --silent --fail -u ${2} "${1}/v3/clusterregistrationtokens" | _gojq_data | gojq -r --arg clusterID "${_clusterId}" 'select((.clusterId==$clusterID) and (.creatorId != null)) | .nodeCommand')
 
   if [[ -z "${_command}" ]]; then
     # Otherwise, look at JSON object with name = "default-token"
-    _command=$(_curl "${1}/v3/clusterregistrationtokens" | _gojq_data | gojq -r --arg clusterID "${_clusterId}" 'select((.clusterId==$clusterID) and (.name == "default-token")) | .nodeCommand')
+    _command=$(curl --silent --fail -u ${2} "${1}/v3/clusterregistrationtokens" | _gojq_data | gojq -r --arg clusterID "${_clusterId}" 'select((.clusterId==$clusterID) and (.name == "default-token")) | .nodeCommand')
   fi
 
   if [[ "${4}" == "worker" ]]; then

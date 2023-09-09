@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+# This python3 script will template etc/rancher-config.yml.j2 file 
+# using jinja2 and will output the final YML file to this folder
+
 import jinja2
 from jinja2 import Environment, FileSystemLoader, Template
 import os, sys
@@ -83,6 +86,7 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit()
 
+    # what will be templated
     data = dict(
         {
             "rke_cluster_config": "rancher-config.yml",
@@ -98,7 +102,7 @@ if __name__ == "__main__":
     print(data)
 
     hostlist = getListOfHostnameIPs(args.hosts)
-    certs_files = getListOfCertificates("shared/ci/etc/pki/certs")
+    certs_files = getListOfCertificates("folder/where/we/store/certs")
     createTMPCertFile(certs_files)
 
     ci_subpath = pathlib.Path(__file__).parent.parent
@@ -106,7 +110,7 @@ if __name__ == "__main__":
     env = Environment(
         loader=FileSystemLoader([pathlib.Path(ci_subpath), pathlib.Path("etc/")])
     )
-    template = env.get_template("etc/rancher/rancher-config.yml.j2")
+    template = env.get_template("etc/rancher-config.yml.j2")
 
     output = template.render(data=data, hostlist=hostlist)
     print(output)
