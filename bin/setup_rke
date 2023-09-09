@@ -1,0 +1,331 @@
+#!/bin/bash
+
+set -e
+
+export PATH=/usr/bin:/bin:/usr/local/bin
+
+self="$(readlink -mn "${BASH_SOURCE[0]}")"
+base="$(dirname "$(dirname "$self")")"
+
+source "$base/bin/common" # common functions e.g. for SOPS encryption/decryption
+
+[ -z "$SSH_AGENT_PID" ] && eval "$(ssh-agent -s)"
+
+_usage() {
+  cat <<EOF
+Usage: $(basename "${BASH_SOURCE[0]}") [--site | --gpg] action [options]
+
+The script manages Rancher RKE1 MNG Cluster installation, incl. upgrade and removal.
+
+Parameters:
+  action:
+    install   -h <hostno> --type <t|p> -d <name> -c <RKE chart> Installs RKE Cluster
+              -k <K8s version> -s3_sec <...> -s3_acc <...>
+    configure -t <token> -d <name>                              Configures RKE Cluster
+    upgrade   -d <name> -k <K8s version>                        Upgrade (all VMs in) RKE Cluster to a new k8s version
+    remove    -d <name>                                         Teardown the whole cluster
+    decrypt   -d <name>                                         Decrypt secrets for RKE Cluster
+    encrypt   -d <name>                                         Encrypt secrets for RKE Cluster
+  options:
+    -h|--hostno   hostno   List of trailing numbers used in host names (like 27 in "avk8s_-node27")
+                           selected as cluster nodes; separated by comma.
+       --type    t|p       Test or Production Node to be used.
+    -s3_[sec|acc] secret   S3 Secret and Access key for creating etcd snapshots.
+    -d|--domain  name      RKE domain name. Example: rancher-t1
+    -c|--chart   version   RKE helm chart version. Example: v2.6.2
+    -k|--k8s     version   RKE Kubernetes version. Example: v1.22.9-rancher1-1
+                           Depends on RKE binary, see compatible versions: https://github.com/rancher/rke/releases
+    -t|--token token       RKE Bearer token.
+    -s|--site name         Select Nexus registry. Default is "$site".
+    -g|--gpg  name         GPG key to encrypt/decrypt helm secrets. Default is "$gpg_key".
+    -m|--dry-run           Check mode.
+       --help              This usage.
+EOF
+  exit "$1"
+}
+
+_setup() {
+  declare -g -a HOST_IDS args
+  declare -g dry action target_hostnames domain s3_acc_key s3_sec_key
+  declare -g rke_k8s_version rke_version rke_user_token gpg_key site registry
+  declare -g node_type
+
+  gpg_key=gitlab-runner
+  helm_release="rancher-rke"
+  domain=
+  site=alp
+  registry="nexus.$site:6666"
+
+  _check_env SOPS_SECRETS_PASSPHRASE ANSIBLE_SSH
+
+  _setup_tmpdir
+  trap _cleanup_tmpdir EXIT
+
+  true
+}
+
+_get_args() {
+  args=("$@")
+  while [[ $# -gt 0 && ( -z "$action" || $1 =~ ^--?[A-Za-z] ) ]] ; do
+    case "$1" in
+         -h|--hostno) eval "HOST_IDS=(${2//,/ })"; shift;;
+         -d|--domain) domain="$2"; shift;;
+ -s3_acc|--s3_access) s3_acc_key="$2"; shift;;
+ -s3_sec|--s3_secret) s3_sec_key="$2"; shift;;
+          -c|--chart) rke_version="$2";shift;;
+            -k|--k8s) rke_k8s_version="$2";shift;;
+          -t|--token) rke_user_token="$2";shift;;
+              --type) node_type="$2";shift;;
+            -g|--gpg) gpg_key="$2"; shift;;
+           -s|--site) site="$2"; shift;;
+        -m|--dry-run) dry=echo;;
+              --help) _usage 0;;
+             install|\
+           configure|\
+              remove|\
+             decrypt|\
+             encrypt|\
+             upgrade) action="$1";;
+                   *) _abort 1 "Unsupported action: $1";;
+    esac
+    [ $# -gt 0 ] && shift
+  done
+
+  [[ -z "$action" || $# -gt 0 ]] && _usage 1
+  true
+
+}
+
+
+_check_binaries() {
+  # RKE binary is necessary because it is used by ansible for creating RKE cluster
+  if ! type rke >/dev/null 2>&1; then
+    curl -LOJ  https://github.com/rancher/rke/releases ....
+    chmod +x rke 
+    mv rke /usr/local/bin
+  fi
+}
+
+_ssh_binaries() {
+  _check_binaries
+  _load_ssh_key "rancher_ssh_vm.key" "$ANSIBLE_SSH"
+}
+
+_rke_up() {
+  if [[ -z "$s3_acc_key" ]]; then
+    _abort 2 "S3 access and secret key are not set."
+  fi
+
+  [ "$action" = "install" ] && _info "Creating RKE local cluster"
+
+  if [[ $action =~ ^(install)$ ]] && [[ ${#HOST_IDS[@]} -eq 0 ]]; then
+    _abort 3 "Servers are not passed."
+  fi
+
+  for num in "${HOST_IDS[@]}"; do
+    arrOUT+=("avk8s$node_type-node$num")
+  done
+  target_hostnames=$(printf "%s," "${arrOUT[@]}")
+  _info "Target hosts: ${target_hostnames[*]}"
+
+  # Does only yaml templating - writes file to $base
+  python3 "$base/bin/rke_template.py" --hosts="${target_hostnames%,*}" --cluster_name="${domain}" \
+          --rke_k8s_version="${rke_k8s_version}" --s3_access_key="${s3_acc_key}" \
+          --s3_secret_key="${s3_sec_key}" --docker_registry="${registry}"
+
+  rke up --config "$base/rancher-config.yml" --ignore-docker-version
+
+  sleep 5
+}
+
+_helm_repo() {
+  helm repo add rancher-stable "https://${registry%:*}/repository/rancher-helm-proxy/"
+}
+
+# https://ranchermanager.docs.rancher.com/v2.7/pages-for-subheaders/installation-and-upgrade
+_rke_helm() {
+
+  # CAREFUL: Any edit to the helm command below, must also reflect changes in helm/rancher-rke/<env>_values.yaml files
+  # useBundledSystemChart is false so that we can edit it in RKE GUI later on
+  helm --kubeconfig "$base/kube_config_rancher-config.yml" upgrade \
+    --install \
+    --no-hooks \
+    --create-namespace \
+    --namespace cattle-system \
+    --set rancherImage="${registry}/rancher/rancher" \
+    --set rancherImageTag="$rke_version" \
+    --set useBundledSystemChart=false \
+    --set version="$rke_version" \
+    --set systemDefaultRegistry="${registry}" \
+    --set hostname="$domain.site.com" \
+    --set ingress.tls.source=secret \
+    --set 'extraEnv[0].name=CATTLE_FEATURES' \
+    --set 'extraEnv[0].value=continuous-delivery=false,harvester=false' \
+    --set privateCA=true,tls=external,additionalTrustedCAs=true,noProxy="127.0.0.0/8\,10.0.0.0/8\,172.16.0.0/12\,192.168.0.0/16\,.svc\,.cluster.local\,.site.com" \
+    "$helm_release" rancher-stable/rancher || true
+
+}
+
+_rke_cluster_installation() {
+
+  _info "Proceed with RKE installation"
+
+  for item in Cert1 Cert2 Cert3; do
+    cat "$base/shared/ci/etc/pki/certs/$item.cer"
+    cat "$base/shared/ci/etc/pki/certs/$item.cer" >> "$TMP/chain_cert.cer"
+  done
+
+  kubectl --kubeconfig "$base/kube_config_rancher-config.yml" create \
+          namespace cattle-system || true
+
+  kubectl --kubeconfig "$base/kube_config_rancher-config.yml" \
+          -n cattle-system create secret generic tls-ca \
+          --from-file=cacerts.pem="$TMP/chain_cert.cer" || true
+
+  # https://ranchermanager.docs.rancher.com/v2.5/reference-guides/installation-references/helm-chart-options#additional-trusted-cas
+  kubectl --kubeconfig "$base/kube_config_rancher-config.yml" \
+          -n cattle-system create secret generic tls-ca-additional \
+          --from-file=ca-additional.pem="$TMP/chain_cert.cer" || true
+
+  sleep 2
+
+  _helm_repo
+  _rke_helm
+
+  _info "Kubernetes Version >= 1.21: See https://github.com/rancher/rancher/issues/33067, https://github.com/kubernetes/ingress-nginx/issues/5968#issuecomment-849772666"
+  # Is also not helping because nginx is installed first anyway.
+  # CA=$(kubectl --kubeconfig "$base/kube_config_rancher-config.yml" -n ingress-nginx get secret ingress-nginx-admission -ojsonpath='{.data.ca}')
+  # kubectl --kubeconfig "$base/kube_config_rancher-config.yml" patch validatingwebhookconfigurations ingress-nginx-admission --type='json' -p='[{"op": "add", "path": "/webhooks/0/clientConfig/caBundle", "value":"'$CA'"}]'
+
+  kubectl --kubeconfig "$base/kube_config_rancher-config.yml" delete -A ValidatingWebhookConfiguration ingress-nginx-admission
+  _rke_helm
+
+  kubectl --kubeconfig "$base/kube_config_rancher-config.yml" -n cattle-system rollout status "deploy/$helm_release"
+}
+
+_configure_rke() {
+
+  curl -X PUT -u "$rke_user_token" "https://$domain.site.com/v3/settings/telemetry-opt" \
+    -H 'Accept: application/json' \
+    -H 'Content-Type: application/json' \
+    -d '{"value":"out"}'
+
+  # https://rancher.com/docs/rancher/v2.x/en/admin-settings/k8s-metadata/#configuring-the-metadata-synchronization
+  rke_metadata_json=$(echo '{"refresh-interval-minutes":"0","url":"https://releases.rancher.com/kontainer-driver-metadata/release-v2.7/data.json"}' | gojq -R -c)
+  cat > "${TMP}/rke_metadata_json" <<EOF
+{
+  "value": $rke_metadata_json
+}
+EOF
+  curl -X PUT -u "${rke_user_token}" "https://$domain.site.com/v3/settings/rke-metadata-config" \
+    -H 'Accept: application/json' \
+    -H 'Content-Type: application/json' \
+    --data @"${TMP}/rke_metadata_json"
+
+  "$base"/sbin/tf_start rke_configuration --domain "$domain" --token "$rke_user_token"
+}
+
+_encrypt_rke_secrets() {
+
+  if [[ -z "$domain" ]]; then
+    _abort 5 "Domain is not set."
+  fi
+
+  _init_gpg_req "$base/lib/secrets" "$SOPS_SECRETS_PASSPHRASE" "$gpg_key"
+
+  if [[ -f "$base/kube_config_rancher-config.yml" ]]; then
+    mv "$base/kube_config_rancher-config.yml" "$base/${domain}_kube_config.yaml.dec"
+    sed -i -r 's/local/'$domain'/' "$base/${domain}_kube_config.yaml.dec"
+    _encrypt "$base/${domain}_kube_config.yaml" "n" "$gpg_key"
+    mv "$base/${domain}_kube_config.yaml" "$base/lib/secrets"
+  fi
+
+  tar --create --verbose rancher-config.rkestate rancher-config.yml --file "${domain}_rke_cluster.dec.tar"
+  _encrypt_binary_path "$base" "${domain}_rke_cluster" tar "n" "$gpg_key"
+
+  _info "Moving both encrypted files to helm repo."
+  mv "$base/${domain}_rke_cluster.tar" "$base/lib/secrets"
+}
+
+_init_config() {
+  _ssh_binaries
+
+  if [[ -z "$rke_version" ]]; then
+    _abort 6 "RKE chart version is not set."
+  fi
+
+  _rke_up
+  _rke_cluster_installation
+  _encrypt_rke_secrets
+}
+
+_decrypt_rke_secrets() {
+
+  if [[ -z "$domain" ]]; then
+    _abort 7 "Domain is not set."
+  fi
+
+  local _temp_mk=/tmp/${domain}_rke_cluster
+  mkdir -p "$_temp_mk"
+  # location of RKE secrets is in helm repo
+  _decrypt_binary_path "$base/lib/secrets" "${domain}_rke_cluster" tar "$_temp_mk" "$HELM_SECRETS_PASSPHRASE" "$gpg_key"
+  tar -xf "$_temp_mk/${domain}_rke_cluster.dec.tar" -C "$_temp_mk"
+  # moving to pwd is important because RKE binary is executed from there
+  mv "$_temp_mk/rancher-config.rkestate" "$base"
+  mv "$_temp_mk/rancher-config.yml" "$base"
+}
+
+_upgrade() {
+
+  _ssh_binaries
+
+  if [[ -z "$domain" ]] || [[ -z "$rke_k8s_version" ]]; then
+    _abort 8 "Parameters not set."
+  fi
+
+  _decrypt_rke_secrets
+
+  if [[ ! -f "$base/rancher-config.yml" ]] && [[ ! -f "$base/rancher-config.rkestate" ]]; then
+    _abort 9 "Decrypted files are not found."
+  fi
+
+  gojq --yaml-input -r '.kubernetes_version = "'${rke_k8s_version}'"' -i rancher-config.yml
+  rke up --config "$base/rancher-config.yml" --ignore-docker-version
+
+  # if cluster is upgraded, secrets change, hence encrypt them again
+  # and move them to helm repository
+  _encrypt_rke_secrets
+
+}
+
+_remove() {
+  _ssh_binaries
+
+  if [[ -z "$domain" ]]; then
+    _abort 10 "Domain is not set."
+  fi
+
+  _decrypt_rke_secrets
+
+  rke remove --config "$base/rancher-config.yml" --ignore-docker-version
+
+  _info "Dont forget to remove secrets from Helm repository."
+}
+
+_main() {
+  _setup
+  _get_args "$@"
+
+  case "$action" in
+    install) _init_config;;
+  configure) _configure_rke;;
+    upgrade) _upgrade;;
+     remove) _remove;;
+    decrypt) _decrypt_rke_secrets;;
+    encrypt) _encrypt_rke_secrets;;
+  esac
+}
+
+_main "$@"
+
+exit 0
